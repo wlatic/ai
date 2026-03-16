@@ -1,0 +1,169 @@
+#!/usr/bin/env python3
+"""List recent claude conversations not currently running in any tmux session.
+Output format: session_id|age|summary|compactions (one per line, max 5)
+
+Also supports: recent-conversations --active SESSION_ID [SESSION_ID ...]
+  Returns: session_id|compactions for each given ID (for active session health)"""
+
+import json, os, glob, time, sys, subprocess
+
+def find_claude_dirs():
+    """Auto-detect claude project dir and sessions dir."""
+    home = os.path.expanduser("~")
+    claude_dir = os.path.join(home, ".claude")
+    sessions_dir = os.path.join(claude_dir, "sessions")
+
+    # Find the project dir — use AI_PROJECT_DIR env var, or auto-detect from cwd
+    project_dir = os.environ.get("AI_PROJECT_DIR")
+    if not project_dir:
+        # Claude stores projects under ~/.claude/projects/ with mangled paths
+        cwd = os.environ.get("AI_CWD", os.getcwd())
+        mangled = cwd.replace("/", "-")
+        project_dir = os.path.join(claude_dir, "projects", mangled)
+        if not os.path.isdir(project_dir):
+            # Try to find any project dir with JSONL files
+            for d in glob.glob(os.path.join(claude_dir, "projects", "*")):
+                if glob.glob(os.path.join(d, "*.jsonl")):
+                    project_dir = d
+                    break
+
+    return project_dir, sessions_dir
+
+PROJECT_DIR, SESSIONS_DIR = find_claude_dirs()
+MAX_RESULTS = int(os.environ.get("MAX_RESULTS", 10))
+
+def get_active_session_ids():
+    """Get session IDs of currently running claude instances."""
+    active = set()
+    for f in glob.glob(f"{SESSIONS_DIR}/*.json"):
+        try:
+            with open(f) as fh:
+                data = json.load(fh)
+                active.add(data.get("sessionId", ""))
+        except Exception:
+            pass
+    return active
+
+def get_compaction_count(filepath):
+    """Count how many times a conversation has been compacted."""
+    count = 0
+    with open(filepath) as fh:
+        for line in fh:
+            try:
+                data = json.loads(line)
+            except Exception:
+                continue
+            if data.get("type") == "system" and data.get("subtype") == "compact_boundary":
+                count += 1
+    return count
+
+def get_conversation_name(session_id):
+    """Read custom name from sidecar file if it exists."""
+    name_file = f"{PROJECT_DIR}/{session_id}.name"
+    if os.path.exists(name_file):
+        with open(name_file) as f:
+            return f.read().strip()
+    return ""
+
+def get_first_user_message(filepath):
+    """Extract first real user message as a summary."""
+    with open(filepath) as fh:
+        for line in fh:
+            try:
+                data = json.loads(line)
+            except Exception:
+                continue
+            if data.get("type") != "user":
+                continue
+            msg = data.get("message", {})
+            content = msg.get("content", "") if isinstance(msg, dict) else str(msg)
+            if isinstance(content, list):
+                text_found = False
+                for item in content:
+                    if isinstance(item, dict) and item.get("type") == "text" and item.get("text"):
+                        content = item["text"]
+                        text_found = True
+                        break
+                if not text_found:
+                    continue  # skip tool_result-only messages
+            # Skip system/agent messages
+            if not isinstance(content, str) or not content.strip():
+                continue
+            if content.startswith(("[{", "Generate a short name", "You are a tmux session janitor", "What is this")):
+                continue
+            # Skip subagent/teammate conversations entirely — user would never resume these
+            if content.startswith(("<teammate-message", "<local-command", "You are a ", "You are **")):
+                return ""
+            return content[:60].replace("\n", " ").strip()
+    return ""
+
+def human_age(mtime):
+    diff = time.time() - mtime
+    if diff < 3600:
+        return f"{int(diff/60)}m ago"
+    elif diff < 86400:
+        return f"{int(diff/3600)}h ago"
+    else:
+        return f"{int(diff/86400)}d ago"
+
+def active_mode(session_ids):
+    """Return compaction count for specific session IDs."""
+    for sid in session_ids:
+        filepath = f"{PROJECT_DIR}/{sid}.jsonl"
+        if os.path.exists(filepath):
+            compactions = get_compaction_count(filepath)
+            print(f"{sid}|{compactions}")
+        else:
+            print(f"{sid}|0")
+
+def list_recent():
+    """List recent conversations not currently running."""
+    active_ids = get_active_session_ids()
+
+    # Sort by size (default) or by modification time (most recent first)
+    sort_by = os.environ.get("SORT_BY", "size")
+    if sort_by == "recent":
+        files = sorted(glob.glob(f"{PROJECT_DIR}/*.jsonl"), key=os.path.getmtime, reverse=True)
+    else:
+        files = sorted(glob.glob(f"{PROJECT_DIR}/*.jsonl"), key=os.path.getsize, reverse=True)
+
+    count = 0
+    for f in files:
+        if count >= MAX_RESULTS:
+            break
+
+        sid = os.path.basename(f).replace(".jsonl", "")
+        if sid in active_ids:
+            continue
+
+        size = os.path.getsize(f)
+        if size < 5000:  # skip empty/tiny/janitor-generated sessions
+            continue
+
+        # Prefer custom name, fall back to first message
+        display = get_conversation_name(sid)
+        if not display:
+            display = get_first_user_message(f)
+        if not display:
+            continue
+
+        age = human_age(os.path.getmtime(f))
+        compactions = get_compaction_count(f)
+        # Human-readable size
+        if size >= 1048576:
+            human_size = f"{size / 1048576:.1f}MB"
+        elif size >= 1024:
+            human_size = f"{size // 1024}KB"
+        else:
+            human_size = f"{size}B"
+        print(f"{sid}|{age}|{display}|{compactions}|{human_size}")
+        count += 1
+
+def main():
+    if len(sys.argv) > 1 and sys.argv[1] == "--active":
+        active_mode(sys.argv[2:])
+    else:
+        list_recent()
+
+if __name__ == "__main__":
+    main()

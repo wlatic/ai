@@ -1,0 +1,247 @@
+#!/bin/bash
+# janitor — Automated tmux session housekeeping agent
+# Runs in a loop doing:
+#   1. Kill idle shell-only sessions (no claude, no real process)
+#   2. Name claude sessions by reading pane content (for auto-generated names)
+#   3. Name conversation JSONL files (for the recent conversations picker)
+#   4. Sync tmux session names to conversation names (for --resume sessions)
+#   5. Kill ghost sessions (claude running, truly empty pane, no conversation)
+
+set -euo pipefail
+
+INTERVAL=300  # 5 minutes
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+LOG_DIR="${SCRIPT_DIR}/../logs"
+LOG_FILE="${LOG_DIR}/janitor.log"
+PROTECTED_SESSIONS="janitor|dev|admin|brain|monitor"
+
+# Auto-detect claude conversation directory
+CLAUDE_DIR="${HOME}/.claude"
+CONV_DIR=""
+for d in "${CLAUDE_DIR}/projects/"*/; do
+  if ls "${d}"*.jsonl >/dev/null 2>&1; then
+    CONV_DIR="${d%/}"
+    break
+  fi
+done
+export AI_PROJECT_DIR="$CONV_DIR"
+
+mkdir -p "$LOG_DIR"
+
+log() {
+    local msg="[$(date '+%Y-%m-%d %H:%M:%S')] $*"
+    echo "$msg"
+    echo "$msg" >> "$LOG_FILE" 2>/dev/null || true
+}
+
+# Get conversation ID from a claude process (checks cmdline first, then session file)
+get_conv_id() {
+    local claude_pid="$1"
+    local cmdline
+    cmdline=$(tr '\0' ' ' < "/proc/${claude_pid}/cmdline" 2>/dev/null) || true
+    if [[ "$cmdline" =~ --resume[[:space:]]+([a-f0-9-]+) ]]; then
+        local cid="${BASH_REMATCH[1]}"
+        if [[ -f "${CONV_DIR}/${cid}.jsonl" ]]; then
+            echo "$cid"
+            return 0
+        fi
+    fi
+    local sf="${HOME}/.claude/sessions/${claude_pid}.json"
+    [[ -f "$sf" ]] || return 0
+    local sid
+    sid=$(python3 -c "import json; print(json.load(open('${sf}'))['sessionId'])" 2>/dev/null) || true
+    if [[ -n "$sid" && -f "${CONV_DIR}/${sid}.jsonl" ]]; then
+        echo "$sid"
+    fi
+}
+
+# Get claude PID from a tmux session
+get_claude_pid() {
+    local sess="$1"
+    local pane_pid
+    pane_pid=$(tmux list-panes -t "$sess" -F '#{pane_pid}' 2>/dev/null | head -1) || true
+    [[ -z "$pane_pid" ]] && return 0
+    ps --ppid "$pane_pid" -o pid= 2>/dev/null | head -1 | tr -d ' ' || true
+}
+
+if [[ "${1:-}" == "--loop" ]]; then
+    :
+else
+    if tmux has-session -t janitor 2>/dev/null; then
+        echo "Janitor already running"
+        exit 0
+    fi
+    tmux new-session -d -s janitor "$(readlink -f "$0") --loop"
+    echo "Janitor session started"
+    exit 0
+fi
+
+run_loop() {
+    log "Janitor started"
+
+    while true; do
+        # ── Task 1: Kill idle shell-only sessions ─────────────────
+        log "Task 1: Checking for idle sessions..."
+        while IFS= read -r sline; do
+            [[ -z "$sline" ]] && continue
+            local sess_name
+            sess_name=$(echo "$sline" | awk '{print $1}')
+            [[ "$sess_name" =~ ^(${PROTECTED_SESSIONS})$ ]] && continue
+            local cmd
+            cmd=$(tmux list-panes -t "$sess_name" -F '#{pane_current_command}' 2>/dev/null | head -1) || true
+            if [[ "$cmd" == "bash" || "$cmd" == "zsh" || "$cmd" == "sh" ]]; then
+                log "Killing idle session '$sess_name' (only $cmd running)"
+                tmux kill-session -t "$sess_name" 2>/dev/null || log "Failed to kill '$sess_name'"
+            fi
+        done < <(tmux list-sessions -F '#{session_name} #{session_created}' 2>/dev/null || true)
+
+        # ── Task 2: Name auto-generated tmux sessions from pane content ──
+        # Reads the screen of each claude session and asks haiku what it's about.
+        # Only touches sessions with auto-generated names (claude-XXXX, digits, unused-).
+        log "Task 2: Naming auto-generated sessions..."
+        while IFS= read -r sline; do
+            [[ -z "$sline" ]] && continue
+            local sess_name
+            sess_name=$(echo "$sline" | awk '{print $1}')
+            [[ "$sess_name" =~ ^(${PROTECTED_SESSIONS})$ ]] && continue
+
+            local cmd
+            cmd=$(tmux list-panes -t "$sess_name" -F '#{pane_current_command}' 2>/dev/null | head -1) || true
+            [[ "$cmd" != "claude" ]] && continue
+
+            # Skip sessions we've already named (rename once, then leave it alone)
+            if grep -qx "$sess_name" /tmp/janitor-named-sessions 2>/dev/null; then
+                continue
+            fi
+
+            local pane_content
+            pane_content=$(tmux capture-pane -t "$sess_name" -p -S -100 2>/dev/null | grep -v '^\s*$' | grep -v '⏵⏵' | grep -v '───' | head -20) || true
+            [[ -z "$pane_content" ]] && continue
+
+            local NEW_NAME
+            NEW_NAME=$(claude --print --no-session-persistence --model haiku "What is this conversation about? Give a short name (2-4 words, lowercase, hyphens). Output ONLY the name. Examples: fleetctl-api-design, zfs-backup-setup, proxmox-upgrade-fix
+
+Screen:
+${pane_content}" 2>/dev/null) || true
+            NEW_NAME=$(echo "$NEW_NAME" | head -1 | tr -d '"' | tr ' ' '-' | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]//g')
+
+            if [[ -n "$NEW_NAME" && ${#NEW_NAME} -gt 2 && ${#NEW_NAME} -lt 40 ]]; then
+                local final_name="$NEW_NAME"
+                if tmux has-session -t "$final_name" 2>/dev/null; then
+                    local n=2
+                    while tmux has-session -t "${NEW_NAME}-${n}" 2>/dev/null; do (( n++ )) || true; done
+                    final_name="${NEW_NAME}-${n}"
+                fi
+                if tmux rename-session -t "$sess_name" "$final_name" 2>/dev/null; then
+                    log "Renamed '$sess_name' → '$final_name'"
+                    echo "$final_name" >> /tmp/janitor-named-sessions
+                else
+                    log "Failed to rename '$sess_name'"
+                fi
+            fi
+        done < <(tmux list-sessions -F '#{session_name} #{session_created}' 2>/dev/null || true)
+
+        # ── Task 3: Name conversation JSONL files (batch) ──────────
+        # One haiku call for ALL unnamed conversations instead of one per conversation.
+        log "Task 3: Naming conversations..."
+        UNNAMED=$(name-conversations --list 2>/dev/null) || UNNAMED=""
+        if [[ -n "$UNNAMED" ]]; then
+            # Build batch: ID|context for each unnamed conversation
+            local BATCH=""
+            while IFS= read -r uline; do
+                [[ -z "$uline" ]] && continue
+                local cid cctx
+                cid=$(echo "$uline" | cut -d'|' -f1)
+                cctx=$(echo "$uline" | cut -d'|' -f2 | head -c 150)
+                BATCH="${BATCH}${cid}|${cctx}
+"
+            done <<< "$UNNAMED"
+
+            # One API call for all
+            local RESULT
+            RESULT=$(claude --print --no-session-persistence --model haiku "Name each conversation below. Output ONLY lines in format: ID|short-name (2-4 words, lowercase, hyphens). Be specific to the topic.
+
+${BATCH}" 2>/dev/null) || true
+
+            # Parse and save
+            while IFS= read -r rline; do
+                [[ -z "$rline" ]] && continue
+                local rid rname
+                rid=$(echo "$rline" | cut -d'|' -f1 | tr -d ' ')
+                rname=$(echo "$rline" | cut -d'|' -f2 | tr -d ' "' | tr ' ' '-' | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]//g')
+                if [[ ${#rid} -gt 30 && -n "$rname" && ${#rname} -gt 2 && ${#rname} -lt 60 ]]; then
+                    name-conversations --save "$rid" "$rname" 2>/dev/null
+                    log "Named $rid → $rname"
+                fi
+            done <<< "$RESULT"
+        else
+            log "No unnamed conversations"
+        fi
+
+        # ── Task 4: Sync tmux names to conversation names ─────────
+        # For --resume sessions where we can map PID → conversation → .name sidecar.
+        log "Task 4: Syncing tmux→conversation names..."
+        while IFS= read -r sline; do
+            [[ -z "$sline" ]] && continue
+            local sess_name
+            sess_name=$(echo "$sline" | awk '{print $1}')
+            [[ "$sess_name" =~ ^(${PROTECTED_SESSIONS})$ ]] && continue
+
+            # Only sync auto-generated names
+            if [[ ! "$sess_name" =~ ^claude- && ! "$sess_name" =~ ^[0-9]+$ ]]; then
+                continue
+            fi
+
+            local claude_pid sid conv_name
+            claude_pid=$(get_claude_pid "$sess_name")
+            [[ -z "$claude_pid" ]] && continue
+            sid=$(get_conv_id "$claude_pid")
+            [[ -z "$sid" ]] && continue
+
+            conv_name=$(cat "${CONV_DIR}/${sid}.name" 2>/dev/null) || true
+            if [[ -n "$conv_name" && "$conv_name" != "$sess_name" ]]; then
+                if ! tmux has-session -t "$conv_name" 2>/dev/null; then
+                    tmux rename-session -t "$sess_name" "$conv_name" 2>/dev/null && \
+                        log "Synced '$sess_name' → '$conv_name'" || \
+                        log "Failed to sync '$sess_name'"
+                fi
+            fi
+        done < <(tmux list-sessions -F '#{session_name} #{session_created}' 2>/dev/null || true)
+
+        # ── Task 5: Kill ghost sessions ───────────────────────────
+        # Ghost = claude running BUT pane is nearly empty (< 5 lines of real content).
+        # NOT based on JSONL mapping — based on what's actually on screen.
+        log "Task 5: Checking for ghosts..."
+        while IFS= read -r sline; do
+            [[ -z "$sline" ]] && continue
+            local sess_name
+            sess_name=$(echo "$sline" | awk '{print $1}')
+            [[ "$sess_name" =~ ^(${PROTECTED_SESSIONS})$ ]] && continue
+
+            local cmd
+            cmd=$(tmux list-panes -t "$sess_name" -F '#{pane_current_command}' 2>/dev/null | head -1) || true
+            [[ "$cmd" != "claude" ]] && continue
+
+            # Count real content lines (skip empty, status bar, UI chrome)
+            local pane_lines
+            pane_lines=$(tmux capture-pane -t "$sess_name" -p -S -50 2>/dev/null | grep -v '^\s*$' | grep -cv '⏵\|───\|│' || echo 0) || true
+
+            if (( pane_lines < 3 )); then
+                if [[ "$sess_name" =~ ^unused- ]]; then
+                    log "Ghost expired: '$sess_name' (empty pane) — killing"
+                    tmux kill-session -t "$sess_name" 2>/dev/null || true
+                else
+                    local unused_num=1
+                    while tmux has-session -t "unused-${unused_num}" 2>/dev/null; do (( unused_num++ )) || true; done
+                    tmux rename-session -t "$sess_name" "unused-${unused_num}" 2>/dev/null && \
+                        log "Ghost: '$sess_name' → 'unused-${unused_num}' (empty pane, will kill next cycle)" || true
+                fi
+            fi
+        done < <(tmux list-sessions -F '#{session_name} #{session_created}' 2>/dev/null || true)
+
+        log "Next check in ${INTERVAL}s"
+        sleep "$INTERVAL"
+    done
+}
+
+run_loop

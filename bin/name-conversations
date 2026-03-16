@@ -1,0 +1,133 @@
+#!/usr/bin/env python3
+"""Find unnamed claude conversations and generate short descriptive names.
+Outputs: session_id|suggested_name (one per line, for conversations needing names)
+
+Names are stored as sidecar files: SESSION_ID.name in the project sessions dir."""
+
+import json, os, glob, sys
+
+def find_project_dir():
+    """Auto-detect claude project dir."""
+    home = os.path.expanduser("~")
+    claude_dir = os.path.join(home, ".claude")
+    project_dir = os.environ.get("AI_PROJECT_DIR")
+    if not project_dir:
+        cwd = os.environ.get("AI_CWD", os.getcwd())
+        mangled = cwd.replace("/", "-")
+        project_dir = os.path.join(claude_dir, "projects", mangled)
+        if not os.path.isdir(project_dir):
+            for d in glob.glob(os.path.join(claude_dir, "projects", "*")):
+                if glob.glob(os.path.join(d, "*.jsonl")):
+                    project_dir = d
+                    break
+    return project_dir
+
+PROJECT_DIR = find_project_dir()
+MAX_PER_RUN = 50  # Process all unnamed in one pass
+
+def get_named_sessions():
+    """Get session IDs that already have a .name sidecar file."""
+    named = set()
+    for f in glob.glob(f"{PROJECT_DIR}/*.name"):
+        sid = os.path.basename(f).replace(".name", "")
+        named.add(sid)
+    return named
+
+def get_first_messages(filepath, count=5):
+    """Extract first N user messages for context."""
+    messages = []
+    with open(filepath) as fh:
+        for line in fh:
+            try:
+                data = json.loads(line)
+            except Exception:
+                continue
+            if data.get("type") != "user":
+                continue
+            msg = data.get("message", {})
+            content = msg.get("content", "") if isinstance(msg, dict) else str(msg)
+            if isinstance(content, list):
+                text_found = False
+                for item in content:
+                    if isinstance(item, dict) and item.get("type") == "text" and item.get("text"):
+                        content = item["text"]
+                        text_found = True
+                        break
+                if not text_found:
+                    continue
+            if not isinstance(content, str) or not content.strip():
+                continue
+            if content.startswith(("<teammate-message", "<local-command", "[{")):
+                continue
+            messages.append(content[:200].replace("\n", " ").strip())
+            if len(messages) >= count:
+                break
+    return messages
+
+def list_unnamed():
+    """List conversations that need naming, with their first messages."""
+    named = get_named_sessions()
+
+    files = sorted(
+        glob.glob(f"{PROJECT_DIR}/*.jsonl"),
+        key=os.path.getmtime,
+        reverse=True
+    )
+
+    count = 0
+    for f in files:
+        if count >= MAX_PER_RUN:
+            break
+
+        sid = os.path.basename(f).replace(".jsonl", "")
+        if sid in named:
+            continue
+
+        size = os.path.getsize(f)
+        if size < 500:
+            continue
+
+        messages = get_first_messages(f)
+        if not messages:
+            continue
+
+        # Output session ID and context for naming
+        context = " | ".join(messages)
+        print(f"{sid}|{context[:300]}")
+        count += 1
+
+def save_name(session_id, name):
+    """Save a conversation name as a sidecar file."""
+    filepath = f"{PROJECT_DIR}/{session_id}.name"
+    with open(filepath, "w") as f:
+        f.write(name.strip())
+
+def read_name(session_id):
+    """Read a conversation name from sidecar file."""
+    filepath = f"{PROJECT_DIR}/{session_id}.name"
+    if os.path.exists(filepath):
+        with open(filepath) as f:
+            return f.read().strip()
+    return ""
+
+def main():
+    if len(sys.argv) > 1:
+        cmd = sys.argv[1]
+        if cmd == "--save" and len(sys.argv) >= 4:
+            # --save SESSION_ID "name"
+            save_name(sys.argv[2], sys.argv[3])
+        elif cmd == "--read" and len(sys.argv) >= 3:
+            # --read SESSION_ID
+            name = read_name(sys.argv[2])
+            if name:
+                print(name)
+        elif cmd == "--list":
+            list_unnamed()
+        else:
+            print(f"Usage: {sys.argv[0]} [--list | --save SID NAME | --read SID]", file=sys.stderr)
+            sys.exit(1)
+    else:
+        list_unnamed()
+
+if __name__ == "__main__":
+    main()

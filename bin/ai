@@ -1,0 +1,649 @@
+#!/bin/bash
+# ai — tmux-native session manager for Claude Code
+# Think of it like Chrome's session restore for AI terminals.
+# Usage: ai [danger|normal] [--help|-h]
+#
+# Config: /etc/ai-agent.conf (optional — allows running as any user)
+
+set -euo pipefail
+
+# ── User detection & switching ────────────────────────────────────────
+# If a system config exists, ensure we're running as the correct user.
+# This lets you type 'ai' as root and it seamlessly switches to the
+# configured user before doing anything else.
+
+AI_CONFIG="/etc/ai-agent.conf"
+
+if [[ -f "$AI_CONFIG" ]]; then
+  # shellcheck source=/dev/null
+  source "$AI_CONFIG"
+
+  AI_USER="${user:-}"
+  PROJECT_DIR="${project_dir:-/mnt/zfs/claude/system}"
+
+  if [[ -n "$AI_USER" && "$(whoami)" != "$AI_USER" ]]; then
+    if [[ "$(id -u)" -eq 0 ]]; then
+      # We're root — switch to the configured user
+      exec su - "$AI_USER" -c "$(readlink -f "$0") $*"
+    else
+      echo "Error: ai must be run as '$AI_USER' or root." >&2
+      echo "  Try: sudo ai $*" >&2
+      exit 1
+    fi
+  fi
+else
+  # No config — use defaults (backwards compatible)
+  PROJECT_DIR="/mnt/zfs/claude/system"
+fi
+
+SKIP_SESSIONS=("janitor" "monitor")
+MODE=""
+MODE_SET_BY_CLI=false
+
+# Auto-detect claude conversation storage
+CLAUDE_DIR="${HOME}/.claude"
+CLAUDE_SESSIONS_DIR="${CLAUDE_DIR}/sessions"
+# Find project dir from PROJECT_DIR (mangled path)
+CLAUDE_PROJECT_DIR="${CLAUDE_DIR}/projects/$(echo "$PROJECT_DIR" | tr '/' '-')"
+if [[ ! -d "$CLAUDE_PROJECT_DIR" ]]; then
+  # Fallback: find first project dir with JSONL files
+  for d in "${CLAUDE_DIR}/projects/"*/; do
+    if ls "${d}"*.jsonl >/dev/null 2>&1; then
+      CLAUDE_PROJECT_DIR="${d%/}"
+      break
+    fi
+  done
+fi
+export AI_PROJECT_DIR="$CLAUDE_PROJECT_DIR"
+export AI_CWD="$PROJECT_DIR"
+
+# ── Helpers ──────────────────────────────────────────────────────────
+
+show_help() {
+  cat <<'HELP'
+ai — tmux-native session manager for Claude Code
+
+Like Chrome's session restore: see all your sessions, pick one, you're back.
+Run from your SSH prompt — not inside tmux.
+Works as any user (auto-switches to the configured user via /etc/ai-agent.conf).
+
+USAGE:
+  ai              Show all sessions — pick one to reconnect, or start new
+  ai danger       Quick-launch a new session (danger mode, skip permissions)
+  ai normal       Quick-launch a new session (normal mode)
+  ai --help       Show this help
+HELP
+}
+
+die() { echo "Error: $*" >&2; exit 1; }
+
+# Human-readable time ago from epoch seconds
+time_ago() {
+  local created="$1"
+  local now
+  now=$(date +%s)
+  local diff=$(( now - created ))
+
+  if (( diff < 60 )); then
+    echo "just now"
+  elif (( diff < 3600 )); then
+    local mins=$(( diff / 60 ))
+    echo "${mins}m ago"
+  elif (( diff < 86400 )); then
+    local hours=$(( diff / 3600 ))
+    echo "${hours}h ago"
+  else
+    local days=$(( diff / 86400 ))
+    echo "${days}d ago"
+  fi
+}
+
+# Check if a session name should be skipped
+is_skipped() {
+  local name="$1"
+  for skip in "${SKIP_SESSIONS[@]}"; do
+    [[ "$name" == "$skip" ]] && return 0
+  done
+  return 1
+}
+
+# Get conversation ID from a tmux session's running claude process
+# Reads /proc/PID/cmdline to find --resume ID or falls back to session file
+get_conversation_id() {
+  local tmux_session="$1"
+  local pane_pid
+  pane_pid=$(tmux list-panes -t "$tmux_session" -F '#{pane_pid}' 2>/dev/null | head -1) || true
+  [[ -z "$pane_pid" ]] && return 0
+
+  local claude_pid
+  claude_pid=$(ps --ppid "$pane_pid" -o pid= 2>/dev/null | head -1 | tr -d ' ') || true
+  [[ -z "$claude_pid" ]] && return 0
+
+  # First try: extract conversation ID from --resume in cmdline
+  local cmdline conv_id
+  cmdline=$(tr '\0' ' ' < "/proc/${claude_pid}/cmdline" 2>/dev/null) || true
+  if [[ "$cmdline" =~ --resume[[:space:]]+([a-f0-9-]+) ]]; then
+    conv_id="${BASH_REMATCH[1]}"
+    if [[ -f "${CLAUDE_PROJECT_DIR}/${conv_id}.jsonl" ]]; then
+      echo "$conv_id"
+      return 0
+    fi
+  fi
+
+  # Fallback: find most recently modified JSONL that contains this session's ID
+  local session_file="${CLAUDE_SESSIONS_DIR}/${claude_pid}.json"
+  [[ -f "$session_file" ]] || return 0
+  local session_id
+  session_id=$(python3 -c "import json; print(json.load(open('${session_file}'))['sessionId'])" 2>/dev/null) || true
+  [[ -z "$session_id" ]] && return 0
+
+  # The conversation JSONL filename IS the conversation ID (same as sessionId for new sessions)
+  if [[ -f "${CLAUDE_PROJECT_DIR}/${session_id}.jsonl" ]]; then
+    echo "$session_id"
+  fi
+}
+
+# Get session info: tmux_name|age|status|has_claude|compactions|display_name|conv_id|attached
+get_sessions() {
+  local sessions=()
+  while IFS= read -r line; do
+    local name created attached_count
+    name=$(echo "$line" | cut -d: -f1)
+    created=$(echo "$line" | cut -d: -f2)
+    attached_count=$(echo "$line" | cut -d: -f3)
+
+    is_skipped "$name" && continue
+
+    local age
+    age=$(time_ago "$created")
+
+    local cmd
+    cmd=$(tmux list-panes -t "$name" -F '#{pane_current_command}' 2>/dev/null | head -1)
+    local status has_claude="no" compactions="0" display_name="$name"
+    if [[ "$cmd" == "claude" ]]; then
+      status="claude running"
+      has_claude="yes"
+      # Get conversation ID, compaction count, and display name
+      local sid
+      sid=$(get_conversation_id "$name" 2>/dev/null) || true
+      if [[ -n "$sid" ]]; then
+        compactions=$(recent-conversations --active "$sid" 2>/dev/null | cut -d'|' -f2) || true
+        compactions="${compactions:-0}"
+        # Get conversation name from sidecar file
+        local conv_name
+        conv_name=$(cat "${CLAUDE_PROJECT_DIR}/${sid}.name" 2>/dev/null) || true
+        if [[ -n "$conv_name" ]]; then
+          display_name="$conv_name"
+        fi
+      fi
+      # If the tmux session has a meaningful name (not auto-generated), use it
+      # regardless of what the sidecar says — tmux name is the most current
+      if [[ ! "$name" =~ ^(claude-|[0-9]+$|unused-) ]]; then
+        display_name="$name"
+      elif [[ "$display_name" == "$name" ]]; then
+        display_name="${name} (unnamed)"
+      fi
+    elif [[ -n "$cmd" ]]; then
+      status="$cmd"
+    else
+      status="unknown"
+    fi
+
+    sessions+=("${name}|${age}|${status}|${has_claude}|${compactions}|${display_name}|${sid:-}|${attached_count}")
+  done < <(tmux list-sessions -F '#{session_name}:#{session_created}:#{session_attached}' 2>/dev/null)
+
+  [[ ${#sessions[@]} -gt 0 ]] && printf '%s\n' "${sessions[@]}"
+}
+
+# ── Session actions ──────────────────────────────────────────────────
+
+auto_session_name() {
+  local base
+  base="claude-$(date +%m%d)"
+  local name="$base"
+  local i=2
+  while tmux has-session -t "$name" 2>/dev/null; do
+    name="${base}-${i}"
+    (( i++ )) || true
+  done
+  echo "$name"
+}
+
+# Pick the first two meaningful words from a session name
+short_title() {
+  local name="$1"
+  local -a picked=()
+  IFS='-' read -ra words <<< "$name"
+  for w in "${words[@]}"; do
+    [[ ${#w} -le 2 ]] && continue
+    [[ "$w" =~ ^(api|the|new|fix|old|dev|session|claude|project|code|work|server|update|status|rewrite|structure|management)$ ]] && continue
+    picked+=("$w")
+    [[ ${#picked[@]} -ge 2 ]] && break
+  done
+  if [[ ${#picked[@]} -eq 0 ]]; then
+    echo "${words[0]}"
+  else
+    echo "${picked[*]}"
+  fi
+}
+
+# Attach to a session
+# $1 = tmux session name, $2 = optional display name for title
+reconnect() {
+  local name="$1"
+  local title_source="${2:-$name}"
+  local short
+  short=$(short_title "$title_source")
+  # Set terminal title BEFORE tmux takes over
+  echo -ne "\033]0;AI| ${short}\007"
+  sleep 0.1
+  exec tmux attach-session -t "$name"
+}
+
+# Ask for mode, then create tmux session and launch claude
+# $1 = extra flags for claude, $2 = optional display name for title
+launch_session() {
+  local extra_flags="${1:-}"
+  local display_name="${2:-}"
+  local sname
+  sname=$(auto_session_name)
+
+  echo ""
+  read -r -p "  Mode: [n]ormal / [d]anger? " mode_choice
+  case "$mode_choice" in
+    d|D) MODE="danger" ;;
+    *)   MODE="normal" ;;
+  esac
+
+  local claude_cmd="cd ${PROJECT_DIR} && claude"
+  if [[ "$MODE" == "danger" ]]; then
+    claude_cmd="cd ${PROJECT_DIR} && claude --dangerously-skip-permissions"
+  fi
+
+  if [[ -n "$extra_flags" ]]; then
+    claude_cmd+=" ${extra_flags}"
+  fi
+
+  echo "  Launching..."
+  tmux new-session -d -s "$sname" -c "$PROJECT_DIR"
+  tmux send-keys -t "$sname" "$claude_cmd" Enter
+  reconnect "$sname" "${display_name:-$sname}"
+}
+
+rename_session() {
+  local -a names=()
+  local i=1
+
+  echo ""
+  while IFS= read -r line; do
+    local name
+    name=$(echo "$line" | cut -d'|' -f1)
+    names+=("$name")
+    echo "  [$i] $name"
+    (( i++ )) || true
+  done < <(get_sessions)
+
+  if [[ ${#names[@]} -eq 0 ]]; then
+    echo "  No sessions to rename."
+    return
+  fi
+
+  echo ""
+  read -r -p "  Which session? " pick
+  if ! [[ "$pick" =~ ^[0-9]+$ ]] || (( pick < 1 || pick > ${#names[@]} )); then
+    echo "  Invalid choice."
+    return
+  fi
+
+  local old_name="${names[$((pick - 1))]}"
+  read -r -p "  New name for '$old_name': " new_name
+  if [[ -z "$new_name" ]]; then
+    echo "  Cancelled."
+    return
+  fi
+
+  if [[ ! "$new_name" =~ ^[a-zA-Z0-9_-]+$ ]]; then
+    echo "  Invalid name (use letters, numbers, hyphens, underscores)"
+    return
+  fi
+
+  tmux rename-session -t "$old_name" "$new_name" 2>/dev/null || { echo "  Rename failed."; return; }
+  echo "  Renamed '$old_name' → '$new_name'"
+}
+
+cleanup_sessions() {
+  local -a dead=()
+
+  while IFS= read -r line; do
+    local name cmd
+    name=$(echo "$line" | cut -d'|' -f1)
+    cmd=$(tmux list-panes -t "$name" -F '#{pane_current_command}' 2>/dev/null | head -1)
+    if [[ "$cmd" == "bash" || "$cmd" == "zsh" || "$cmd" == "sh" ]]; then
+      dead+=("$name")
+    fi
+  done < <(get_sessions)
+
+  if [[ ${#dead[@]} -eq 0 ]]; then
+    echo "  No idle sessions found."
+    return
+  fi
+
+  echo ""
+  echo "  Idle sessions (shell only, no active process):"
+  for name in "${dead[@]}"; do
+    echo "    - $name"
+  done
+
+  echo ""
+  read -r -p "  Kill these sessions? [y/N] " confirm
+  case "$confirm" in
+    y|Y)
+      for name in "${dead[@]}"; do
+        tmux kill-session -t "$name" 2>/dev/null
+        echo "  Killed: $name"
+      done
+      ;;
+    *) echo "  Cancelled." ;;
+  esac
+}
+
+# ── Browse all conversations ─────────────────────────────────────────
+
+browse_all() {
+  local sort_mode="${1:-size}"
+
+  echo ""
+  echo "┌─────────────────────────────┐"
+  echo "│   All Conversations         │"
+  echo "└─────────────────────────────┘"
+
+  if [[ "$sort_mode" == "size" ]]; then
+    echo "  Sorted by: size (largest first)"
+  else
+    echo "  Sorted by: most recent"
+  fi
+  echo ""
+
+  local -a all_ids=()
+  local -a all_summaries=()
+  local -a all_ages=()
+  local -a all_compactions=()
+  local -a all_sizes=()
+
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    all_ids+=("$(echo "$line" | cut -d'|' -f1)")
+    all_ages+=("$(echo "$line" | cut -d'|' -f2)")
+    all_summaries+=("$(echo "$line" | cut -d'|' -f3)")
+    all_compactions+=("$(echo "$line" | cut -d'|' -f4)")
+    all_sizes+=("$(echo "$line" | cut -d'|' -f5)")
+  done < <(MAX_RESULTS=50 SORT_BY="$sort_mode" recent-conversations 2>/dev/null)
+
+  if [[ ${#all_ids[@]} -eq 0 ]]; then
+    echo "  No conversations found."
+    echo ""
+    read -r -p "  Press Enter to go back..." _
+    session_picker
+    return
+  fi
+
+  local i=1
+  for idx in "${!all_ids[@]}"; do
+    local health=""
+    local c="${all_compactions[$idx]}"
+    if (( c == 0 )); then
+      health="fresh"
+    elif (( c == 1 )); then
+      health="compacted 1x"
+    else
+      health="compacted ${c}x"
+    fi
+    local sz="${all_sizes[$idx]:-}"
+    printf "  [%d] %-30s — %s, %s, %s\n" "$i" "${all_summaries[$idx]}" "${all_ages[$idx]}" "$health" "$sz"
+    (( i++ )) || true
+  done
+
+  echo ""
+  if [[ "$sort_mode" == "size" ]]; then
+    echo "  [s] Sort by recent   [b] Back   [q] Quit"
+  else
+    echo "  [s] Sort by size     [b] Back   [q] Quit"
+  fi
+  echo ""
+  read -r -p "  Pick: " pick
+
+  case "$pick" in
+    q|Q) exit 0 ;;
+    b|B) session_picker ;;
+    s|S)
+      if [[ "$sort_mode" == "size" ]]; then
+        browse_all "recent"
+      else
+        browse_all "size"
+      fi
+      ;;
+    *)
+      if [[ "$pick" =~ ^[0-9]+$ ]] && (( pick >= 1 && pick <= ${#all_ids[@]} )); then
+        local chosen_id="${all_ids[$((pick - 1))]}"
+        local chosen_summary="${all_summaries[$((pick - 1))]}"
+        echo "  Resuming conversation..."
+        launch_session "--resume ${chosen_id}" "$chosen_summary"
+      else
+        echo "  Invalid choice."
+        browse_all "$sort_mode"
+      fi
+      ;;
+  esac
+}
+
+# ── Session picker ───────────────────────────────────────────────────
+
+session_picker() {
+  # Collect active sessions (claude running in tmux)
+  local -a active_tmux_names=()   # tmux session name (for reconnect)
+  local -a active_display_names=() # conversation name (for display)
+  local -a active_ages=()
+  local -a active_compactions=()
+  local -a active_conv_ids=()    # conversation IDs (to filter from recent)
+  local -a active_attached=()    # whether session is attached in another tab
+  local idle_count=0
+
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    local tmux_name age has_claude compactions display_name conv_id att
+    tmux_name=$(echo "$line" | cut -d'|' -f1)
+    age=$(echo "$line" | cut -d'|' -f2)
+    has_claude=$(echo "$line" | cut -d'|' -f4)
+    compactions=$(echo "$line" | cut -d'|' -f5)
+    display_name=$(echo "$line" | cut -d'|' -f6)
+    conv_id=$(echo "$line" | cut -d'|' -f7)
+    att=$(echo "$line" | cut -d'|' -f8)
+
+    if [[ "$has_claude" == "yes" ]]; then
+      active_tmux_names+=("$tmux_name")
+      active_display_names+=("${display_name:-$tmux_name}")
+      active_ages+=("$age")
+      active_compactions+=("${compactions:-0}")
+      active_attached+=("${att:-0}")
+      [[ -n "$conv_id" ]] && active_conv_ids+=("$conv_id")
+    else
+      (( idle_count++ )) || true
+    fi
+  done < <(get_sessions)
+
+  # Collect recent conversations (not currently running)
+  local -a recent_ids=()
+  local -a recent_ages=()
+  local -a recent_summaries=()
+  local -a recent_compactions=()
+  local -a recent_sizes=()
+
+  if command -v recent-conversations >/dev/null 2>&1; then
+    while IFS= read -r line; do
+      [[ -z "$line" ]] && continue
+      local rid
+      rid=$(echo "$line" | cut -d'|' -f1)
+      # Skip conversations already shown in active sessions
+      local is_active=false
+      for acid in "${active_conv_ids[@]+"${active_conv_ids[@]}"}"; do
+        [[ "$rid" == "$acid" ]] && is_active=true && break
+      done
+      [[ "$is_active" == true ]] && continue
+
+      recent_ids+=("$rid")
+      recent_ages+=("$(echo "$line" | cut -d'|' -f2)")
+      recent_summaries+=("$(echo "$line" | cut -d'|' -f3)")
+      recent_compactions+=("$(echo "$line" | cut -d'|' -f4)")
+      recent_sizes+=("$(echo "$line" | cut -d'|' -f5)")
+    done < <(recent-conversations 2>/dev/null)
+  fi
+
+  # Display
+  echo ""
+  echo "┌─────────────────────────────┐"
+  echo "│   Claude Code Sessions      │"
+  echo "└─────────────────────────────┘"
+
+  local num=1
+
+  # Active sessions
+  if [[ ${#active_tmux_names[@]} -gt 0 ]]; then
+    echo ""
+    echo "  Active:"
+    for idx in "${!active_tmux_names[@]}"; do
+      local health=""
+      local c="${active_compactions[$idx]}"
+      if (( c == 0 )); then
+        health="fresh"
+      elif (( c == 1 )); then
+        health="compacted 1x"
+      else
+        health="compacted ${c}x — consider new session"
+      fi
+
+      local tags=""
+      # Show if already attached in another tab
+      if (( ${active_attached[$idx]:-0} > 0 )); then
+        tags+=" [open]"
+      fi
+
+      printf "  [%d] %-30s — %s, %s%s\n" "$num" "${active_display_names[$idx]}" "${active_ages[$idx]}" "$health" "$tags"
+      (( num++ )) || true
+    done
+  fi
+
+  # Recent conversations
+  local recent_start=$num
+  if [[ ${#recent_ids[@]} -gt 0 ]]; then
+    echo ""
+    echo "  Recent conversations:"
+    for idx in "${!recent_ids[@]}"; do
+      local health=""
+      local c="${recent_compactions[$idx]}"
+      if (( c == 0 )); then
+        health="fresh"
+      elif (( c == 1 )); then
+        health="compacted 1x"
+      else
+        health="compacted ${c}x"
+      fi
+      local sz="${recent_sizes[$idx]:-}"
+      printf "  [%d] %-30s — %s, %s, %s\n" "$num" "${recent_summaries[$idx]}" "${recent_ages[$idx]}" "$health" "$sz"
+      (( num++ )) || true
+    done
+  fi
+
+  if [[ ${#active_tmux_names[@]} -eq 0 && ${#recent_ids[@]} -eq 0 ]]; then
+    echo ""
+    echo "  No active sessions or recent conversations."
+  fi
+
+  if (( idle_count > 0 )); then
+    echo ""
+    echo "  (${idle_count} idle session(s) — use [c] to clean up)"
+  fi
+
+  echo ""
+  echo "  [n] New session   [a] Browse all conversations"
+  echo "  [r] Rename        [c] Cleanup   [q] Quit"
+  echo ""
+  read -r -p "  Pick: " pick
+
+  local total_active=${#active_tmux_names[@]}
+  local total_recent=${#recent_ids[@]}
+  local total_numbered=$(( total_active + total_recent ))
+
+  case "$pick" in
+    q|Q) exit 0 ;;
+    n|N) launch_session ;;
+    a|A) browse_all ;;
+    r|R) rename_session; session_picker ;;
+    c|C) cleanup_sessions; session_picker ;;
+    *)
+      if [[ "$pick" =~ ^[0-9]+$ ]] && (( pick >= 1 && pick <= total_numbered )); then
+        if (( pick <= total_active )); then
+          # Active session — reconnect using tmux session name
+          local chosen_tmux="${active_tmux_names[$((pick - 1))]}"
+          local chosen_display="${active_display_names[$((pick - 1))]}"
+          echo "  Reconnecting to '${chosen_display}'..."
+          reconnect "$chosen_tmux" "$chosen_display"
+        else
+          # Recent conversation — resume into new tmux session
+          local recent_idx=$(( pick - total_active - 1 ))
+          local chosen_id="${recent_ids[$recent_idx]}"
+          local chosen_summary="${recent_summaries[$recent_idx]}"
+          echo "  Resuming conversation..."
+          launch_session "--resume ${chosen_id}" "$chosen_summary"
+        fi
+      else
+        echo "  Invalid choice."
+        session_picker
+      fi
+      ;;
+  esac
+}
+
+# ── Quick-launch (ai danger / ai normal) ────────────────────────────
+
+quick_launch() {
+  local sname
+  sname=$(auto_session_name)
+
+  echo "  Launching... (${MODE} mode)"
+  tmux new-session -d -s "$sname" -c "$PROJECT_DIR"
+
+  local cmd="cd ${PROJECT_DIR} && claude"
+  if [[ "$MODE" == "danger" ]]; then
+    cmd="cd ${PROJECT_DIR} && claude --dangerously-skip-permissions"
+  fi
+
+  tmux send-keys -t "$sname" "$cmd" Enter
+  reconnect "$sname"
+}
+
+# ── Main ─────────────────────────────────────────────────────────────
+
+# Parse args
+for arg in "$@"; do
+  case "$arg" in
+    danger)   MODE="danger"; MODE_SET_BY_CLI=true ;;
+    normal)   MODE="normal"; MODE_SET_BY_CLI=true ;;
+    -h|--help) show_help; exit 0 ;;
+    *) die "Unknown argument: $arg (try 'ai --help')" ;;
+  esac
+done
+
+MODE="${MODE:-normal}"
+
+command -v tmux >/dev/null 2>&1 || die "tmux is required but not installed"
+
+# ai must be run from outside tmux — it's a session manager, not a launcher
+[[ -n "${TMUX:-}" ]] && die "Don't run ai inside tmux. Detach first (Ctrl+B, D) then run ai."
+
+if [[ "$MODE_SET_BY_CLI" == true ]]; then
+  # ai danger / ai normal — quick-launch, no menu
+  quick_launch
+else
+  # Show the session picker (works from anywhere)
+  session_picker
+fi

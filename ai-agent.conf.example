@@ -1,0 +1,11 @@
+# /etc/ai-agent.conf — System config for the ai session manager
+# Copy this to /etc/ai-agent.conf and edit as needed.
+#
+# This allows any user (especially root) to run 'ai' and it will
+# automatically switch to the correct user before launching.
+
+# The user that owns the claude sessions
+user=claude
+
+# The project directory (where claude code runs from)
+project_dir=/mnt/zfs/claude/system
