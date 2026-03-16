@@ -23,8 +23,9 @@ if [[ -f "$AI_CONFIG" ]]; then
 
   if [[ -n "$AI_USER" && "$(whoami)" != "$AI_USER" ]]; then
     if [[ "$(id -u)" -eq 0 ]]; then
-      # We're root — switch to the configured user
-      exec su - "$AI_USER" -c "$(readlink -f "$0") $*"
+      # We're root — switch to the configured user with a proper TTY
+      # Using script -c to allocate a PTY so tmux attach works
+      exec script -qc "su - $AI_USER -c '$(readlink -f "$0") $*'" /dev/null
     else
       echo "Error: ai must be run as '$AI_USER' or root." >&2
       echo "  Try: sudo ai $*" >&2
@@ -39,23 +40,6 @@ fi
 SKIP_SESSIONS=("janitor" "monitor")
 MODE=""
 MODE_SET_BY_CLI=false
-
-# Auto-detect claude conversation storage
-CLAUDE_DIR="${HOME}/.claude"
-CLAUDE_SESSIONS_DIR="${CLAUDE_DIR}/sessions"
-# Find project dir from PROJECT_DIR (mangled path)
-CLAUDE_PROJECT_DIR="${CLAUDE_DIR}/projects/$(echo "$PROJECT_DIR" | tr '/' '-')"
-if [[ ! -d "$CLAUDE_PROJECT_DIR" ]]; then
-  # Fallback: find first project dir with JSONL files
-  for d in "${CLAUDE_DIR}/projects/"*/; do
-    if ls "${d}"*.jsonl >/dev/null 2>&1; then
-      CLAUDE_PROJECT_DIR="${d%/}"
-      break
-    fi
-  done
-fi
-export AI_PROJECT_DIR="$CLAUDE_PROJECT_DIR"
-export AI_CWD="$PROJECT_DIR"
 
 # ── Helpers ──────────────────────────────────────────────────────────
 
@@ -124,21 +108,21 @@ get_conversation_id() {
   cmdline=$(tr '\0' ' ' < "/proc/${claude_pid}/cmdline" 2>/dev/null) || true
   if [[ "$cmdline" =~ --resume[[:space:]]+([a-f0-9-]+) ]]; then
     conv_id="${BASH_REMATCH[1]}"
-    if [[ -f "${CLAUDE_PROJECT_DIR}/${conv_id}.jsonl" ]]; then
+    if [[ -f "/home/claude/.claude/projects/-mnt-zfs-claude-system/${conv_id}.jsonl" ]]; then
       echo "$conv_id"
       return 0
     fi
   fi
 
   # Fallback: find most recently modified JSONL that contains this session's ID
-  local session_file="${CLAUDE_SESSIONS_DIR}/${claude_pid}.json"
+  local session_file="/home/claude/.claude/sessions/${claude_pid}.json"
   [[ -f "$session_file" ]] || return 0
   local session_id
   session_id=$(python3 -c "import json; print(json.load(open('${session_file}'))['sessionId'])" 2>/dev/null) || true
   [[ -z "$session_id" ]] && return 0
 
   # The conversation JSONL filename IS the conversation ID (same as sessionId for new sessions)
-  if [[ -f "${CLAUDE_PROJECT_DIR}/${session_id}.jsonl" ]]; then
+  if [[ -f "/home/claude/.claude/projects/-mnt-zfs-claude-system/${session_id}.jsonl" ]]; then
     echo "$session_id"
   fi
 }
@@ -171,7 +155,7 @@ get_sessions() {
         compactions="${compactions:-0}"
         # Get conversation name from sidecar file
         local conv_name
-        conv_name=$(cat "${CLAUDE_PROJECT_DIR}/${sid}.name" 2>/dev/null) || true
+        conv_name=$(cat "/home/claude/.claude/projects/-mnt-zfs-claude-system/${sid}.name" 2>/dev/null) || true
         if [[ -n "$conv_name" ]]; then
           display_name="$conv_name"
         fi
