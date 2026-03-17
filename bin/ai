@@ -24,8 +24,7 @@ if [[ -f "$AI_CONFIG" ]]; then
   if [[ -n "$AI_USER" && "$(whoami)" != "$AI_USER" ]]; then
     if [[ "$(id -u)" -eq 0 ]]; then
       # We're root — switch to the configured user with a proper TTY
-      # Using script -c to allocate a PTY so tmux attach works
-      exec script -qc "su - $AI_USER -c '$(readlink -f "$0") $*'" /dev/null
+      exec script -qc "sudo -iu $AI_USER $(readlink -f "$0") $*" /dev/null
     else
       echo "Error: ai must be run as '$AI_USER' or root." >&2
       echo "  Try: sudo ai $*" >&2
