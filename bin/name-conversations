@@ -6,23 +6,7 @@ Names are stored as sidecar files: SESSION_ID.name in the project sessions dir."
 
 import json, os, glob, sys
 
-def find_project_dir():
-    """Auto-detect claude project dir."""
-    home = os.path.expanduser("~")
-    claude_dir = os.path.join(home, ".claude")
-    project_dir = os.environ.get("AI_PROJECT_DIR")
-    if not project_dir:
-        cwd = os.environ.get("AI_CWD", os.getcwd())
-        mangled = cwd.replace("/", "-")
-        project_dir = os.path.join(claude_dir, "projects", mangled)
-        if not os.path.isdir(project_dir):
-            for d in glob.glob(os.path.join(claude_dir, "projects", "*")):
-                if glob.glob(os.path.join(d, "*.jsonl")):
-                    project_dir = d
-                    break
-    return project_dir
-
-PROJECT_DIR = find_project_dir()
+PROJECT_DIR = "/home/claude/.claude/projects/-mnt-zfs-claude-system"
 MAX_PER_RUN = 50  # Process all unnamed in one pass
 
 def get_named_sessions():

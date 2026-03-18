@@ -10,21 +10,10 @@
 set -euo pipefail
 
 INTERVAL=300  # 5 minutes
-SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
-LOG_DIR="${SCRIPT_DIR}/../logs"
+LOG_DIR="/mnt/zfs/claude/system/logs"
 LOG_FILE="${LOG_DIR}/janitor.log"
 PROTECTED_SESSIONS="janitor|dev|admin|brain|monitor"
-
-# Auto-detect claude conversation directory
-CLAUDE_DIR="${HOME}/.claude"
-CONV_DIR=""
-for d in "${CLAUDE_DIR}/projects/"*/; do
-  if ls "${d}"*.jsonl >/dev/null 2>&1; then
-    CONV_DIR="${d%/}"
-    break
-  fi
-done
-export AI_PROJECT_DIR="$CONV_DIR"
+CONV_DIR="/home/claude/.claude/projects/-mnt-zfs-claude-system"
 
 mkdir -p "$LOG_DIR"
 
@@ -46,7 +35,7 @@ get_conv_id() {
             return 0
         fi
     fi
-    local sf="${HOME}/.claude/sessions/${claude_pid}.json"
+    local sf="/home/claude/.claude/sessions/${claude_pid}.json"
     [[ -f "$sf" ]] || return 0
     local sid
     sid=$(python3 -c "import json; print(json.load(open('${sf}'))['sessionId'])" 2>/dev/null) || true
@@ -115,11 +104,16 @@ run_loop() {
             fi
 
             local pane_content
-            pane_content=$(tmux capture-pane -t "$sess_name" -p -S -100 2>/dev/null | grep -v '^\s*$' | grep -v '⏵⏵' | grep -v '───' | head -20) || true
-            [[ -z "$pane_content" ]] && continue
+            pane_content=$(tmux capture-pane -t "$sess_name" -p -S -100 2>/dev/null | grep -v '^\s*$' | grep -v '⏵⏵' | grep -v '───' | grep -v '━' | grep -v 'aiagents' | grep -v 'Launch Claude' | grep -v 'Claude is the interface' | head -20) || true
+            # Need at least 5 lines of real conversation content — skip startup/MOTD
+            local line_count
+            line_count=$(echo "$pane_content" | wc -l) || true
+            if (( line_count < 5 )); then
+                continue
+            fi
 
             local NEW_NAME
-            NEW_NAME=$(claude --print --no-session-persistence --model haiku "What is this conversation about? Give a short name (2-4 words, lowercase, hyphens). Output ONLY the name. Examples: fleetctl-api-design, zfs-backup-setup, proxmox-upgrade-fix
+            NEW_NAME=$(cd /tmp && claude --print --no-session-persistence --model haiku "What is this conversation about? Give a short name (2-4 words, lowercase, hyphens). Output ONLY the name. Examples: fleetctl-api-design, zfs-backup-setup, proxmox-upgrade-fix
 
 Screen:
 ${pane_content}" 2>/dev/null) || true
@@ -135,6 +129,18 @@ ${pane_content}" 2>/dev/null) || true
                 if tmux rename-session -t "$sess_name" "$final_name" 2>/dev/null; then
                     log "Renamed '$sess_name' → '$final_name'"
                     echo "$final_name" >> /tmp/janitor-named-sessions
+                    # Push terminal title update to attached clients
+                    local short
+                    IFS='-' read -ra _words <<< "$final_name"
+                    local -a _picked=()
+                    for _w in "${_words[@]}"; do
+                        [[ ${#_w} -le 2 ]] && continue
+                        [[ "$_w" =~ ^(api|the|new|fix|old|dev|session|claude|project|code|work|server|update|status|rewrite|structure|management)$ ]] && continue
+                        _picked+=("$_w")
+                        [[ ${#_picked[@]} -ge 2 ]] && break
+                    done
+                    short="${_picked[*]:-${_words[0]}}"
+                    tmux run-shell -t "$final_name" "printf '\\033]0;AI| ${short}\\007'" 2>/dev/null || true
                 else
                     log "Failed to rename '$sess_name'"
                 fi
@@ -159,7 +165,7 @@ ${pane_content}" 2>/dev/null) || true
 
             # One API call for all
             local RESULT
-            RESULT=$(claude --print --no-session-persistence --model haiku "Name each conversation below. Output ONLY lines in format: ID|short-name (2-4 words, lowercase, hyphens). Be specific to the topic.
+            RESULT=$(cd /tmp && claude --print --no-session-persistence --model haiku "Name each conversation below. Output ONLY lines in format: ID|short-name (2-4 words, lowercase, hyphens). Be specific to the topic.
 
 ${BATCH}" 2>/dev/null) || true
 

@@ -5,31 +5,10 @@ Output format: session_id|age|summary|compactions (one per line, max 5)
 Also supports: recent-conversations --active SESSION_ID [SESSION_ID ...]
   Returns: session_id|compactions for each given ID (for active session health)"""
 
-import json, os, glob, time, sys, subprocess
+import json, os, glob, time, sys
 
-def find_claude_dirs():
-    """Auto-detect claude project dir and sessions dir."""
-    home = os.path.expanduser("~")
-    claude_dir = os.path.join(home, ".claude")
-    sessions_dir = os.path.join(claude_dir, "sessions")
-
-    # Find the project dir — use AI_PROJECT_DIR env var, or auto-detect from cwd
-    project_dir = os.environ.get("AI_PROJECT_DIR")
-    if not project_dir:
-        # Claude stores projects under ~/.claude/projects/ with mangled paths
-        cwd = os.environ.get("AI_CWD", os.getcwd())
-        mangled = cwd.replace("/", "-")
-        project_dir = os.path.join(claude_dir, "projects", mangled)
-        if not os.path.isdir(project_dir):
-            # Try to find any project dir with JSONL files
-            for d in glob.glob(os.path.join(claude_dir, "projects", "*")):
-                if glob.glob(os.path.join(d, "*.jsonl")):
-                    project_dir = d
-                    break
-
-    return project_dir, sessions_dir
-
-PROJECT_DIR, SESSIONS_DIR = find_claude_dirs()
+PROJECT_DIR = "/home/claude/.claude/projects/-mnt-zfs-claude-system"
+SESSIONS_DIR = "/home/claude/.claude/sessions"
 MAX_RESULTS = int(os.environ.get("MAX_RESULTS", 10))
 
 def get_active_session_ids():
