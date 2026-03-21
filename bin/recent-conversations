@@ -99,8 +99,8 @@ def list_recent():
     """List recent conversations not currently running."""
     active_ids = get_active_session_ids()
 
-    # Sort by size (default) or by modification time (most recent first)
-    sort_by = os.environ.get("SORT_BY", "size")
+    # Sort by most recent (default) or by size
+    sort_by = os.environ.get("SORT_BY", "recent")
     if sort_by == "recent":
         files = sorted(glob.glob(f"{PROJECT_DIR}/*.jsonl"), key=os.path.getmtime, reverse=True)
     else:
