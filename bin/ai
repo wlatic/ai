@@ -214,12 +214,7 @@ short_title() {
 # $1 = tmux session name, $2 = optional display name for title
 reconnect() {
   local name="$1"
-  local title_source="${2:-$name}"
-  local short
-  short=$(short_title "$title_source")
-  # Set terminal title BEFORE tmux takes over
-  echo -ne "\033]0;AI| ${short}\007"
-  sleep 0.1
+  # Title is set automatically by tmux via set-titles-string 'AI| #S'
   exec tmux attach-session -t "$name"
 }
 

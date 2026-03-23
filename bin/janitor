@@ -88,24 +88,26 @@ run_loop() {
         # Reads the screen of each claude session and asks haiku what it's about.
         # Only touches sessions with auto-generated names (claude-XXXX, digits, unused-).
         log "Task 2: Naming auto-generated sessions..."
+        # Read sessions into array first — avoids set -e killing the process substitution
+        local -a t2_sessions=()
         while IFS= read -r sline; do
-            [[ -z "$sline" ]] && continue
-            local sess_name
-            sess_name=$(echo "$sline" | awk '{print $1}')
+            [[ -n "$sline" ]] && t2_sessions+=("$sline")
+        done < <(tmux list-sessions -F '#{session_name}' 2>/dev/null || true)
+
+        for sess_name in "${t2_sessions[@]}"; do
             [[ "$sess_name" =~ ^(${PROTECTED_SESSIONS})$ ]] && continue
 
             local cmd
             cmd=$(tmux list-panes -t "$sess_name" -F '#{pane_current_command}' 2>/dev/null | head -1) || true
             [[ "$cmd" != "claude" ]] && continue
 
-            # Skip sessions we've already named (rename once, then leave it alone)
+            # Skip sessions we've already named
             if grep -qx "$sess_name" /tmp/janitor-named-sessions 2>/dev/null; then
                 continue
             fi
 
             local pane_content
             pane_content=$(tmux capture-pane -t "$sess_name" -p -S -100 2>/dev/null | grep -v '^\s*$' | grep -v '⏵⏵' | grep -v '───' | grep -v '━' | grep -v 'aiagents' | grep -v 'Launch Claude' | grep -v 'Claude is the interface' | head -20) || true
-            # Need at least 5 lines of real conversation content — skip startup/MOTD
             local line_count
             line_count=$(echo "$pane_content" | wc -l) || true
             if (( line_count < 5 )); then
@@ -129,7 +131,7 @@ ${pane_content}" 2>/dev/null) || true
                 if tmux rename-session -t "$sess_name" "$final_name" 2>/dev/null; then
                     log "Renamed '$sess_name' → '$final_name'"
                     echo "$final_name" >> /tmp/janitor-named-sessions
-                    # Push terminal title update to attached clients
+                    # Push terminal title update
                     local short
                     IFS='-' read -ra _words <<< "$final_name"
                     local -a _picked=()
@@ -144,8 +146,10 @@ ${pane_content}" 2>/dev/null) || true
                 else
                     log "Failed to rename '$sess_name'"
                 fi
+            else
+                log "Skipped naming '$sess_name' (bad name: '$NEW_NAME')"
             fi
-        done < <(tmux list-sessions -F '#{session_name} #{session_created}' 2>/dev/null || true)
+        done
 
         # ── Task 3: Name conversation JSONL files (batch) ──────────
         # One haiku call for ALL unnamed conversations instead of one per conversation.
